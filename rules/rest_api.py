@@ -11,6 +11,7 @@ from collections import OrderedDict
 import json
 
 from django.core.exceptions import SuspiciousOperation, ValidationError
+from django.db.models import Case, When
 
 from rest_framework.views import APIView
 from rest_framework.validators import UniqueValidator
@@ -39,13 +40,15 @@ from rules.views import get_public_sources, fetch_public_sources, extract_rule_r
 from rules.rest_processing import RuleProcessingFilterViewSet
 from rules.es_data import ESData
 
+from scirius.rest_utils import SciriusReadOnlyModelViewSet
+from scirius.settings import USE_EVEBOX, USE_KIBANA, KIBANA_PROXY, KIBANA_URL, ELASTICSEARCH_KEYWORD
 from rules.es_graphs import ESStats, ESRulesStats, ESSidByHosts, ESFieldStats, \
         ESTimeline, ESMetricsTimeline, ESHealth, ESIndicesStats, ESRulesPerCategory, ESAlertsCount, \
         ESLatestStats, ESIppairAlerts, ESIppairNetworkAlerts, ESAlertsTail, ESSuriLogTail, ESPoststats, \
         ESSigsListHits, ESTopRules, ESError, ESDeleteAlertsBySid, ESEventsFromFlowID
 
-from scirius.rest_utils import SciriusReadOnlyModelViewSet
-from scirius.settings import USE_EVEBOX, USE_KIBANA, KIBANA_PROXY, KIBANA_URL, ELASTICSEARCH_KEYWORD
+import backends
+_es_backend = backends.get_es_backend()
 
 Probe = __import__(settings.RULESET_MIDDLEWARE)
 
@@ -479,75 +482,29 @@ class RuleHitsOrderingFilter(OrderingFilter):
                 value = None
         return value
 
-    def _get_hits_order(self, request, order):
-        try:
-            result = ESTopRules(request).get(count=Rule.objects.count(), order=order)
-        except ESError:
-            queryset = Rule.objects.order_by('sid')
-            queryset = queryset.annotate(hits=models.Value(0, output_field=models.IntegerField()))
-            queryset = queryset.annotate(hits=models.ExpressionWrapper(models.Value(0), output_field=models.IntegerField()))
-            return queryset.values_list('sid', 'hits')
-
-        result = map(lambda x: (x['key'], x['doc_count']), result)
-        return result
-
-    def _filter_min_max(self, request, queryset, hits_order):
-        hits_by_sid = dict(hits_order)
-
+    def _filter_min_max(self, request, queryset):
         min_hits = self.get_query_param(request, 'hits_min')
         if min_hits is not None:
-            queryset = filter(lambda x: hits_by_sid.get(x.sid, 0) >= min_hits, queryset)
+            queryset = queryset.filter(hits__gte=int(min_hits))
 
         max_hits = self.get_query_param(request, 'hits_max')
         if max_hits is not None:
-            queryset = filter(lambda x: hits_by_sid.get(x.sid, 0) <= max_hits, queryset)
+            queryset = queryset.filter(hits__lte=int(max_hits))
 
         return queryset
 
     def filter_queryset(self, request, queryset, view):
         ordering = self.get_ordering(request, queryset, view)
 
-        if 'hits' in ordering or '-hits' in ordering:
-            if ordering[0] not in ('hits', '-hits'):
-                raise ParseError('hits ordering can only be the first ordering term')
-
-            hits_order = ordering[0]
-            ordering = ordering[1:]
-
-            if ordering:
-                ordering = tuple(list(ordering) + ['sid'])
-                queryset = queryset.order_by(*ordering)
-
-            # Sorting
-            order = 'asc' if hits_order == 'hits' else 'desc'
-            hits_order = self._get_hits_order(request, order)
-
-            queryset = self._filter_min_max(request, queryset, hits_order)
-
-            # Index rules by sid
-            rules = OrderedDict([(r.sid, r) for r in queryset])
-
-            queryset = []
-            for sid, count in hits_order:
-                try:
-                    queryset.append(rules.pop(sid))
-                except KeyError:
-                    pass
-
-            if order == 'desc':
-                queryset += rules.values()
-            else:
-                queryset = rules.values() + queryset
-
-        else:
-            if ordering:
-                ordering = tuple(list(ordering) + ['sid'])
-                queryset = queryset.order_by(*ordering)
-
-            if self.get_query_param(request, 'hits_min') is not None \
-                    or self.get_query_param(request, 'hits_max') is not None:
-                hits_order = self._get_hits_order(request, 'asc')
-                queryset = self._filter_min_max(request, queryset, hits_order)
+        if any(x in ordering for x in ['hits', '-hits']) or any(x in request.GET for x in ['hits_min', 'hits_max']):
+            hits_order = _es_backend.get_top_rules(request, count=Rule.objects.count(), order='desc')
+            hits_by_sid = {x['key']: x['doc_count'] for x in hits_order}
+            hits_case = Case(
+                *[When(sid=int(sid), then=models.Value(hits, models.IntegerField())) for sid, hits in hits_by_sid.items()],
+                default=models.Value(0, models.IntegerField()))
+            queryset = queryset.annotate(hits=hits_case)
+            queryset = self._filter_min_max(request, queryset)
+        queryset = queryset.order_by(*ordering)
 
         return queryset
 
@@ -893,57 +850,17 @@ class RuleViewSet(SciriusReadOnlyModelViewSet):
 
         return Response(res)
 
-    def _scirius_hit(self, r):
-        timeline = []
-        for entry in r['timeline']['buckets']:
-            timeline.append({
-                'date': entry['key'],
-                'hits': entry['doc_count']
-            })
-
-        probes = []
-        for entry in r['probes']['buckets']:
-            probes.append({
-                'probe': entry['key'],
-                'hits': entry['doc_count']
-            })
-
-        return {
-            'hits': r['doc_count'],
-            'timeline_data': timeline,
-            'probes': probes
-        }
-
-    def _add_hits(self, request, data):
-        sids = ','.join([unicode(rule['sid']) for rule in data])
-
-        try:
-            result = ESSigsListHits(request).get(sids)
-        except ESError:
-            return data
-
-        ## reformat ES's output
-        hits = {}
-        for r in result:
-            hits[r['key']] = self._scirius_hit(r)
-
+    def _add_hits_and_timeline_data(self, request, data):
+        sids = [r['sid'] for r in data]
+        timeline_and_probe_hits = _es_backend.get_signature_timeline_and_probe_hits(request, sids)
         for rule in data:
-            sid = rule['sid']
-            if sid in hits:
-                rule.update(hits[sid])
-            else:
-                rule.update({
-                    'hits': 0,
-                    'timeline_data': [],
-                    'probes': []
-                })
-        return data
+            rule.update(timeline_and_probe_hits[unicode(rule['sid'])])
 
     def list(self, request):
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
         serializer = self.get_serializer(page, many=True)
-        data = self._add_hits(request, serializer.data)
+        self._add_hits_and_timeline_data(request, serializer.data)
         return self.get_paginated_response(serializer.data)
 
 
@@ -1939,7 +1856,7 @@ class ESRulesViewSet(ESBaseViewSet):
         if len(errors) > 0:
             raise serializers.ValidationError(errors)
 
-        return Response({'rules': ESRulesStats(request).get(dict_format=True)})
+        return Response({'rules': _es_backend.get_rules_stats_dict(request)})
 
 
 class ESRuleViewSet(ESBaseViewSet):
@@ -1966,7 +1883,7 @@ class ESRuleViewSet(ESBaseViewSet):
         if len(errors) > 0:
             raise serializers.ValidationError(errors)
 
-        return Response({'rule': ESSidByHosts(request).get(sid, dict_format=True)})
+        return Response({'rule': _es_backend.get_sid_by_hosts_dict(request, sid)})
 
 
 class ESTopRulesViewSet(ESBaseViewSet):
@@ -1981,7 +1898,7 @@ class ESTopRulesViewSet(ESBaseViewSet):
             errors = {'hosts': ['This field is required.']}
             raise serializers.ValidationError(errors)
 
-        return Response(ESTopRules(request).get(count=count, order=order))
+        return Response(_es_backend.get_top_rules(request, count=count, order=order))
 
 
 class ESSigsListViewSet(ESBaseViewSet):
@@ -1989,7 +1906,7 @@ class ESSigsListViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        sids = request.GET.get('sids', 20)
+        sids = request.GET.get('sids', None)
 
         errors = {}
         if sids is None:
@@ -2001,7 +1918,8 @@ class ESSigsListViewSet(ESBaseViewSet):
         if len(errors) > 0:
             raise serializers.ValidationError(errors)
 
-        return Response(ESSigsListHits(request).get(sids))
+        sids = sids.split(',')
+        return Response(_es_backend.get_sigs_list_hits(request, sids))
 
 
 class ESPostStatsViewSet(ESBaseViewSet):
@@ -2010,7 +1928,7 @@ class ESPostStatsViewSet(ESBaseViewSet):
 
     def _get(self, request, format=None):
         value = request.GET.get('value', None)
-        return Response(ESPoststats(request).get(value=value))
+        return Response(_es_backend.get_poststats(request, value=value))
 
 
 class ESFieldStatsViewSet(ESBaseViewSet):
@@ -2032,9 +1950,7 @@ class ESFieldStatsViewSet(ESBaseViewSet):
         if filter_ip not in ['src_port', 'dest_port', 'alert.signature_id', 'alert.severity', 'http.length', 'http.status', 'vlan', 'geoip.provider.autonomous_system_number', 'tunnel.depth']:
             filter_ip = filter_ip + '.' + settings.ELASTICSEARCH_KEYWORD
 
-        hosts = ESFieldStats(request).get(sid, filter_ip,
-                                   count=count,
-                                   dict_format=True)
+        hosts = _es_backend.get_field_stats_dict(request, sid, filter_ip, count=count)
 
         return Response(hosts)
 
@@ -2081,12 +1997,7 @@ class ESFilterIPViewSet(ESBaseViewSet):
 
         filter_ip = self.RULE_FIELDS_MAPPING[field]
         count = request.GET.get('page_size', 10)
-
-        hosts = ESFieldStats(request).get(sid,
-                                   filter_ip + '.' + settings.ELASTICSEARCH_KEYWORD,
-                                   count=count,
-                                   dict_format=True)
-
+        hosts = _es_backend.get_field_stats_dict(request, sid, filter_ip, count=count)
         return Response(hosts)
 
 
@@ -2109,7 +2020,7 @@ class ESTimelineViewSet(ESBaseViewSet):
 
     def _get(self, request, format=None):
         tags = False if request.GET.get('target', 'false') == 'false' else True
-        return Response(ESTimeline(request).get(tags=tags))
+        return Response(_es_backend.get_timeline(request, tags=tags))
 
 
 class ESLogstashEveViewSet(ESBaseViewSet):
@@ -2181,7 +2092,7 @@ class ESLogstashEveViewSet(ESBaseViewSet):
 
     def _get(self, request, format=None):
         value = request.GET.get('value', None)
-        return Response(ESMetricsTimeline(request).get(value=value))
+        return Response(_es_backend.get_metrics_timeline(request, value=value))
 
 
 class ESHealthViewSet(ESBaseViewSet):
@@ -2199,7 +2110,7 @@ class ESHealthViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESHealth(request).get())
+        return Response(_es_backend.get_health(request))
 
 
 class ESStatsViewSet(ESBaseViewSet):
@@ -2228,7 +2139,7 @@ class ESStatsViewSet(ESBaseViewSet):
     =============================================================================================================================================================
     """
     def _get(self, request, format=None):
-        return Response(ESStats(request).get())
+        return Response(_es_backend.get_stats(request))
 
 
 class ESCheckVersionViewSet(APIView):
@@ -2268,7 +2179,7 @@ class ESIndicesViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response({'indices': ESIndicesStats(request).get()})
+        return Response({'indices': _es_backend.get_indices_stats(request)})
 
 
 class ESRulesPerCategoryViewSet(ESBaseViewSet):
@@ -2296,7 +2207,7 @@ class ESRulesPerCategoryViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESRulesPerCategory(request).get())
+        return Response(_es_backend.get_rules_per_category(request))
 
 
 class ESAlertsCountViewSet(ESBaseViewSet):
@@ -2321,7 +2232,8 @@ class ESAlertsCountViewSet(ESBaseViewSet):
     def _get(self, request, format=None):
         prev = request.GET.get('prev', None)
         prev = 1 if prev is not None and prev != 'false' else None
-        return Response(ESAlertsCount(request).get(prev=prev))
+
+        return Response(_es_backend.get_alerts_count(request, prev=prev))
 
 
 class ESLatestStatsViewSet(ESBaseViewSet):
@@ -2351,7 +2263,7 @@ class ESLatestStatsViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESLatestStats(request).get())
+        return Response(_es_backend.es_get_latest_stats(request))
 
 
 class ESIPPairAlertsViewSet(ESBaseViewSet):
@@ -2377,7 +2289,7 @@ class ESIPPairAlertsViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESIppairAlerts(request).get())
+        return Response(_es_backend.get_ippair_alerts(request))
 
 
 class ESIPPairNetworkAlertsViewSet(ESBaseViewSet):
@@ -2398,7 +2310,7 @@ class ESIPPairNetworkAlertsViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESIppairNetworkAlerts(request).get())
+        return Response(_es_backend.get_ippair_network_alerts(request))
 
 
 class ESAlertsTailViewSet(ESBaseViewSet):
@@ -2407,12 +2319,14 @@ class ESAlertsTailViewSet(ESBaseViewSet):
     ==== GET ====\n
     qfilter: "filter in Elasticsearch Query String Query format"
 
+    Returns a json encoded list of raw alert data for the last 100 alerts
+
     Show alert tail:\n
         curl -k https://x.x.x.x/rest/rules/es/alerts_tail/\?from_date\=1537264545477 -H 'Authorization: Token <token>' -H 'Content-Type: application/json' -X GET
 
     Return:\n
         HTTP/1.1 200 OK
-        []
+        [{{"proto":"006","tls":{"notafter":"202", ...}, ...}, ...] 
 
     =============================================================================================================================================================
 
@@ -2421,7 +2335,7 @@ class ESAlertsTailViewSet(ESBaseViewSet):
     def _get(self, request, format=None):
         search_target = request.GET.get('search_target', True)
         search_target = False if search_target is not True else True
-        return Response(ESAlertsTail(request).get(search_target=search_target))
+        return Response(_es_backend.get_alerts_tail(request, search_target=search_target))
 
 
 class ESEventsFromFlowIDViewSet(ESBaseViewSet):
@@ -2464,7 +2378,7 @@ class ESSuriLogTailViewSet(ESBaseViewSet):
     """
 
     def _get(self, request, format=None):
-        return Response(ESSuriLogTail(request).get())
+        return Response(_es_backend.suri_log_tail(request))
 
 
 class ESDeleteLogsViewSet(APIView):

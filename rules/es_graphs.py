@@ -1526,8 +1526,6 @@ def get_top_alerts():
                   "range": {
                     "{{ timestamp }}": {
                       "gte": {{ from_date }},
-                      "lte": {{ to_date }}
-
                     }
                   }
                 }, {
@@ -1635,7 +1633,6 @@ def get_sigs_list_hits():
                       "range": {
                         "{{ timestamp }}": {
                           "gte": {{ from_date }},
-                          "lte": {{ to_date }}
                         }
                       }
                     }, {

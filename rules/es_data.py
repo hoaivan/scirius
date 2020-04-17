@@ -41,9 +41,12 @@ from rules.es_graphs import get_es_major_version
 es_logger = logging.getLogger('elasticsearch')
 es_logger.setLevel(logging.INFO)
 
+import backends
+_es_backend = backends.get_es_backend()
+
 # Mapping
 def get_kibana_mappings():
-    if get_es_major_version() < 6:
+    if _es_backend.get_es_major_version() < 6:
         return { "dashboard":
             { "properties":
                 {
@@ -1751,7 +1754,7 @@ class ESData(object):
         i = 0
         ids = []
 
-        if get_es_major_version() >= 6:
+        if _es_backend.get_es_major_version() >= 6:
             body['query']['query_string']['query'] += ' type:%s' % _type
             _type = self.doc_type
 
@@ -1777,7 +1780,7 @@ class ESData(object):
         os.makedirs(dest)
 
         while True:
-            if get_es_major_version() < 6:
+            if _es_backend.get_es_major_version() < 6:
                 res = self.client.search(index='.kibana', from_=i, doc_type=_type, body=body)
             else:
                 res = self.client.search(index='.kibana', from_=i, body=body)
@@ -1792,7 +1795,7 @@ class ESData(object):
                 filename = os.path.join(dest, _id)
                 filename += '.json'
 
-                if get_es_major_version() < 6:
+                if _es_backend.get_es_major_version() < 6:
                     res = self.client.get(index='.kibana', doc_type=_type, id=_id)
                 else:
                     res = self.client.get(index='.kibana', doc_type=self.doc_type, id=_id)
@@ -1808,7 +1811,7 @@ class ESData(object):
             _types = _types + ('index-pattern',)
 
         for _type in _types:
-            if get_es_major_version() < 6:
+            if _es_backend.get_es_major_version() < 6:
                 if full:
                     body = {'query': {'match_all': {}}}
                 else:
@@ -1862,7 +1865,7 @@ class ESData(object):
             content = f.read()
         name = _file.rsplit('/', 1)[1]
         name = name.rsplit('.', 1)[0]
-        if get_es_major_version() < 6:
+        if _es_backend.get_es_major_version() < 6:
             doc_type = _type
         else:
             doc_type = self.doc_type
@@ -1879,7 +1882,7 @@ class ESData(object):
             raise
 
     def _kibana_set_default_index(self, idx):
-        if get_es_major_version() < 6:
+        if _es_backend.get_es_major_version() < 6:
             res = self.client.search(index='.kibana', doc_type='config', body={'query': {'match_all': {}}}, request_cache=False)
         else:
             body = {'query': {'query_string': {'query': 'type: config'}}}
@@ -1889,12 +1892,12 @@ class ESData(object):
             content = hit['_source']
             content['defaultIndex'] = idx
 
-            if get_es_major_version() < 6:
+            if _es_backend.get_es_major_version() < 6:
                 self.client.update(index='.kibana', doc_type='config', id=hit['_id'], body={'doc': content}, refresh=True)
             elif get_es_major_version() < 7:
                 self.client.update(index='.kibana', doc_type=self.doc_type, id=hit['_id'], body=content, refresh=True)
         else:
-            if get_es_major_version() >= 6:
+            if _es_backend.get_es_major_version() >= 6:
                 self._kibana_request('/api/kibana/settings/defaultIndex', {'value': 'logstash-*'})
             else:
                 print >> sys.stderr, "Warning: unknown ES version, not setting Kibana's defaultIndex"
@@ -1986,7 +1989,7 @@ class ESData(object):
             for _file in self._get_kibana_subdirfiles(_type):
                 self._kibana_inject(_type, _file)
 
-        if get_es_major_version() >= 6:
+        if _es_backend.get_es_major_version() >= 6:
             self._kibana_request('/api/spaces/space', KIBANA6_NAMESPACE)
 
         self._kibana_set_default_index('logstash-*')
