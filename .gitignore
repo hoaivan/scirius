@@ -6,3 +6,11 @@ node_modules
 rules/static/dist
 rules/static/doc
 doc/_build/
+*/dist
+.idea
+static
+hunt/src/img/*
+hunt/src/css/*
+hunt/src/fonts/*
+logs
+db.sqlite3
