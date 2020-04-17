@@ -1,4 +1,20 @@
 =======
+INSTALL
+=======
+Success build steps on Manjaro:
+
+sudo npm install -g npm@latest webpack@3.11
+npm i ajv@^6.0.0
+npm i ajv-keywords@3.1.0
+node -i fsevents -f
+npm install
+
+Before running webpack, run:
+npm --depth 9999 update
+npm rebuild node-sass
+
+
+=======
 Scirius
 =======
 
