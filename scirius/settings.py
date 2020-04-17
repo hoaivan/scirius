@@ -156,7 +156,7 @@ LOGGING = {
         'elasticsearch': {
             'level': 'INFO',
             'class': 'logging.FileHandler',
-            'filename': '/var/log/scirius/elasticsearch.log',
+            'filename': './logs/elasticsearch.log',
             'formatter': 'raw',
         },
     },
@@ -202,7 +202,7 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.TokenAuthentication',
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 30 
+    'PAGE_SIZE': 30
 }
 
 # Static files (CSS, JavaScript, Images)
